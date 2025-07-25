@@ -7,14 +7,17 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import sys
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, TypedDict, cast
+from urllib.parse import unquote
 
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
+from mcp.types import AnyUrl
 from openai import AsyncAzureOpenAI
 from pydantic import BaseModel, Field
 
@@ -46,6 +49,10 @@ DEFAULT_EMBEDDER_MODEL = 'text-embedding-3-small'
 # Decrease this if you're experiencing 429 rate limit errors from your LLM provider.
 # Increase if you have high rate limits.
 SEMAPHORE_LIMIT = int(os.getenv('SEMAPHORE_LIMIT', 10))
+
+
+# Note: Native MCP doesn't support middleware
+# Multi-tenant functionality will be implemented differently
 
 
 class Requirement(BaseModel):
@@ -312,6 +319,7 @@ class GraphitiLLMConfig(BaseModel):
                         model=self.model,
                         small_model=self.small_model,
                         temperature=self.temperature,
+                        max_tokens=32768,  # Increased from default 8192 (2025-07-28) to prevent response truncation
                     ),
                 )
             elif self.api_key:
@@ -328,6 +336,7 @@ class GraphitiLLMConfig(BaseModel):
                         model=self.model,
                         small_model=self.small_model,
                         temperature=self.temperature,
+                        max_tokens=32768,  # Increased from default 8192 (2025-07-28) to prevent response truncation
                     ),
                 )
             else:
@@ -337,7 +346,10 @@ class GraphitiLLMConfig(BaseModel):
             raise ValueError('OPENAI_API_KEY must be set when using OpenAI API')
 
         llm_client_config = LLMConfig(
-            api_key=self.api_key, model=self.model, small_model=self.small_model
+            api_key=self.api_key, 
+            model=self.model, 
+            small_model=self.small_model,
+            max_tokens=32768  # Increased from default 8192 (2025-07-28) to prevent response truncation
         )
 
         # Set temperature
@@ -497,8 +509,8 @@ class GraphitiConfig(BaseModel):
         # Apply CLI overrides
         if args.group_id:
             config.group_id = args.group_id
-        else:
-            config.group_id = 'default'
+        # Note: Don't set config.group_id to 'default' if not provided
+        # This allows X-Project header to work properly in multi-tenant scenarios
 
         config.use_custom_entities = args.use_custom_entities
         config.destroy_graph = args.destroy_graph
@@ -512,7 +524,7 @@ class GraphitiConfig(BaseModel):
 class MCPConfig(BaseModel):
     """Configuration for MCP server."""
 
-    transport: str = 'sse'  # Default to SSE transport
+    transport: str = 'streamable-http'  # Default to streamable-http transport
 
     @classmethod
     def from_cli(cls, args: argparse.Namespace) -> 'MCPConfig':
@@ -527,6 +539,12 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 logger = logging.getLogger(__name__)
+
+# Reduce noise from third-party libraries
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+logging.getLogger('neo4j').setLevel(logging.WARNING)
+logging.getLogger('sse_starlette').setLevel(logging.WARNING)
+logging.getLogger('mcp.server').setLevel(logging.INFO)
 
 # Create global config instance - will be properly initialized later
 config = GraphitiConfig()
@@ -567,6 +585,8 @@ mcp = FastMCP(
     'Graphiti Agent Memory',
     instructions=GRAPHITI_MCP_INSTRUCTIONS,
 )
+
+# Note: Native MCP doesn't support middleware
 
 # Initialize Graphiti client
 graphiti_client: Graphiti | None = None
@@ -624,6 +644,8 @@ async def initialize_graphiti():
     except Exception as e:
         logger.error(f'Failed to initialize Graphiti: {str(e)}')
         raise
+
+
 
 
 def format_fact_result(edge: EntityEdge) -> dict[str, Any]:
@@ -688,10 +710,90 @@ async def process_episode_queue(group_id: str):
         logger.info(f'Stopped episode queue worker for group_id: {group_id}')
 
 
+def get_dynamic_group_id(ctx: Context, explicit_group_id: str | None = None) -> str:
+    """
+    Determine the appropriate group_id using a priority-based system for multi-tenant data isolation.
+    
+    This function implements a comprehensive fallback system that enables both automatic 
+    multi-tenancy via HTTP headers AND selective cross-project operations when needed.
+    
+    Priority order (highest to lowest):
+    1. explicit_group_id parameter - Direct override for specific operations
+    2. X-Project HTTP header - Multi-tenant project context with enhanced processing:
+       - URL decoding (My%20Project → My Project)  
+       - Space-to-underscore conversion (My Project → My_Project)
+       - Case-insensitive header matching (X-Project or x-project)
+    3. config.group_id - CLI configuration default (--group-id parameter)
+    4. 'default' - Final fallback for all operations
+    
+    Args:
+        ctx: MCP Context object containing request information and headers
+        explicit_group_id: Direct group_id parameter from tool call (highest priority)
+    
+    Returns:
+        str: The resolved group_id for database operations, guaranteed to be valid
+             for Graphiti core (alphanumeric, hyphens, underscores only)
+             
+    Examples:
+        # Automatic multi-tenancy via header
+        X-Project: "My Project Name" → group_id: "My_Project_Name"
+        
+        # URL-encoded header support  
+        X-Project: "Documentation%20Project" → group_id: "Documentation_Project"
+        
+        # Explicit override
+        add_memory(..., group_id="shared-data") # Uses "shared-data" regardless of header
+    """
+    # Priority 1: Explicit parameter
+    if explicit_group_id:
+        return explicit_group_id
+    
+    # Priority 2: X-Project header (available in streamable-http and SSE transports)
+    try:
+        if hasattr(ctx, 'request_context') and ctx.request_context is not None:
+            request = ctx.request_context.request
+            if request is not None and hasattr(request, 'headers'):
+                # HTTP headers are case-insensitive, search for X-Project header
+                x_project = None
+                for key, value in request.headers.items():
+                    if key.lower() == 'x-project':
+                        x_project = value
+                        break
+                if x_project:
+                    # Decode URL-encoded values (e.g., %20 for spaces)
+                    try:
+                        x_project_decoded = unquote(x_project)
+                        # Clean up extra whitespace
+                        x_project_decoded = ' '.join(x_project_decoded.split())
+                    except Exception as e:
+                        logger.warning(f'Failed to decode X-Project header {x_project}: {e}')
+                        x_project_decoded = x_project
+                    
+                    # Enhanced validation: alphanumeric, hyphens, underscores, and spaces
+                    if re.match(r'^[a-zA-Z0-9_\-\s]+$', x_project_decoded):
+                        # Convert spaces to underscores to comply with Graphiti core validation
+                        # This enables human-readable project names while maintaining database compatibility
+                        x_project_sanitized = re.sub(r'\s+', '_', x_project_decoded)
+                        logger.info(f'Using X-Project header as group_id: {x_project_decoded} -> {x_project_sanitized}')
+                        return x_project_sanitized
+                    else:
+                        logger.warning(f'Invalid X-Project header format: {x_project_decoded}')
+    except Exception as e:
+        logger.error(f'Could not extract X-Project header: {e}', exc_info=True)
+    
+    # Priority 3: Config group_id from CLI argument
+    if config and config.group_id:
+        return config.group_id
+    
+    # Priority 4: Final fallback to 'default'
+    return 'default'
+
+
 @mcp.tool()
 async def add_memory(
     name: str,
     episode_body: str,
+    ctx: Context,
     group_id: str | None = None,
     source: str = 'text',
     source_description: str = '',
@@ -707,8 +809,8 @@ async def add_memory(
         episode_body (str): The content of the episode to persist to memory. When source='json', this must be a
                            properly escaped JSON string, not a raw Python dictionary. The JSON data will be
                            automatically processed to extract entities and relationships.
-        group_id (str, optional): A unique ID for this graph. If not provided, uses the default group_id from CLI
-                                 or a generated one.
+        group_id (str, optional): A unique ID for this graph. If provided, overrides X-Project header.
+                                 If not provided, uses X-Project header, CLI config, or 'default' fallback.
         source (str, optional): Source type, must be one of:
                                - 'text': For plain text content (default)
                                - 'json': For structured data
@@ -754,6 +856,10 @@ async def add_memory(
     """
     global graphiti_client, episode_queues, queue_workers
 
+    # DEBUG: Log function entry and parameters
+    logger.debug(f'add_memory called with: name={name}, group_id={group_id}, ctx={ctx is not None}')
+    logger.debug(f'Context type: {type(ctx)}, Context value: {ctx}')
+
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
 
@@ -765,8 +871,8 @@ async def add_memory(
         elif source.lower() == 'json':
             source_type = EpisodeType.json
 
-        # Use the provided group_id or fall back to the default from config
-        effective_group_id = group_id if group_id is not None else config.group_id
+        # Use the provided group_id or get from X-Project header, fall back to config default  
+        effective_group_id = get_dynamic_group_id(ctx, group_id)
 
         # Cast group_id to str to satisfy type checker
         # The Graphiti client expects a str for group_id, not Optional[str]
@@ -829,6 +935,7 @@ async def add_memory(
 @mcp.tool()
 async def search_memory_nodes(
     query: str,
+    ctx: Context,
     group_ids: list[str] | None = None,
     max_nodes: int = 10,
     center_node_uuid: str | None = None,
@@ -841,7 +948,8 @@ async def search_memory_nodes(
 
     Args:
         query: The search query
-        group_ids: Optional list of group IDs to filter results
+        group_ids: Optional list of group IDs to filter results. If provided, overrides X-Project header.
+                  If not provided, uses X-Project header, CLI config, or 'default' fallback.
         max_nodes: Maximum number of nodes to return (default: 10)
         center_node_uuid: Optional UUID of a node to center the search around
         entity: Optional single entity type to filter results (permitted: "Preference", "Procedure")
@@ -852,10 +960,12 @@ async def search_memory_nodes(
         return ErrorResponse(error='Graphiti client not initialized')
 
     try:
-        # Use the provided group_ids or fall back to the default from config if none provided
-        effective_group_ids = (
-            group_ids if group_ids is not None else [config.group_id] if config.group_id else []
-        )
+        # Use the provided group_ids or get from X-Project header, fall back to config default
+        if group_ids is not None:
+            effective_group_ids = group_ids
+        else:
+            dynamic_group_id = get_dynamic_group_id(ctx)
+            effective_group_ids = [dynamic_group_id] if dynamic_group_id else []
 
         # Configure the search
         if center_node_uuid is not None:
@@ -910,6 +1020,7 @@ async def search_memory_nodes(
 @mcp.tool()
 async def search_memory_facts(
     query: str,
+    ctx: Context,
     group_ids: list[str] | None = None,
     max_facts: int = 10,
     center_node_uuid: str | None = None,
@@ -918,7 +1029,8 @@ async def search_memory_facts(
 
     Args:
         query: The search query
-        group_ids: Optional list of group IDs to filter results
+        group_ids: Optional list of group IDs to filter results. If provided, overrides X-Project header.
+                  If not provided, uses X-Project header, CLI config, or 'default' fallback.
         max_facts: Maximum number of facts to return (default: 10)
         center_node_uuid: Optional UUID of a node to center the search around
     """
@@ -932,10 +1044,12 @@ async def search_memory_facts(
         if max_facts <= 0:
             return ErrorResponse(error='max_facts must be a positive integer')
 
-        # Use the provided group_ids or fall back to the default from config if none provided
-        effective_group_ids = (
-            group_ids if group_ids is not None else [config.group_id] if config.group_id else []
-        )
+        # Use the provided group_ids or get from X-Project header, fall back to config default
+        if group_ids is not None:
+            effective_group_ids = group_ids
+        else:
+            dynamic_group_id = get_dynamic_group_id(ctx)
+            effective_group_ids = [dynamic_group_id] if dynamic_group_id else []
 
         # We've already checked that graphiti_client is not None above
         assert graphiti_client is not None
@@ -1054,12 +1168,15 @@ async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
 
 @mcp.tool()
 async def get_episodes(
-    group_id: str | None = None, last_n: int = 10
+    ctx: Context,
+    group_id: str | None = None,
+    last_n: int = 10,
 ) -> list[dict[str, Any]] | EpisodeSearchResponse | ErrorResponse:
     """Get the most recent memory episodes for a specific group.
 
     Args:
-        group_id: ID of the group to retrieve episodes from. If not provided, uses the default group_id.
+        group_id: ID of the group to retrieve episodes from. If provided, overrides X-Project header.
+                 If not provided, uses X-Project header, CLI config, or 'default' fallback.
         last_n: Number of most recent episodes to retrieve (default: 10)
     """
     global graphiti_client
@@ -1068,8 +1185,8 @@ async def get_episodes(
         return ErrorResponse(error='Graphiti client not initialized')
 
     try:
-        # Use the provided group_id or fall back to the default from config
-        effective_group_id = group_id if group_id is not None else config.group_id
+        # Use the provided group_id or get from X-Project header, fall back to config default
+        effective_group_id = get_dynamic_group_id(ctx, group_id)
 
         if not isinstance(effective_group_id, str):
             return ErrorResponse(error='Group ID must be a string')
@@ -1173,9 +1290,9 @@ async def initialize_server() -> MCPConfig:
     )
     parser.add_argument(
         '--transport',
-        choices=['sse', 'stdio'],
-        default='sse',
-        help='Transport to use for communication with the client. (default: sse)',
+        choices=['sse', 'stdio', 'streamable-http'],
+        default='streamable-http',
+        help='Transport to use for communication with the client. streamable-http provides /mcp endpoint, sse provides /sse endpoint. Both support X-Project headers. (default: streamable-http)',
     )
     parser.add_argument(
         '--model', help=f'Model name to use with the LLM client. (default: {DEFAULT_LLM_MODEL})'
@@ -1235,7 +1352,7 @@ async def run_mcp_server():
     # Initialize the server
     mcp_config = await initialize_server()
 
-    # Run the server with stdio transport for MCP in the same event loop
+    # Run the server with specified transport
     logger.info(f'Starting MCP server with transport: {mcp_config.transport}')
     if mcp_config.transport == 'stdio':
         await mcp.run_stdio_async()
@@ -1244,6 +1361,11 @@ async def run_mcp_server():
             f'Running MCP server with SSE transport on {mcp.settings.host}:{mcp.settings.port}'
         )
         await mcp.run_sse_async()
+    elif mcp_config.transport == 'streamable-http':
+        logger.info(
+            f'Running MCP server with streamable-http transport on {mcp.settings.host}:{mcp.settings.port}'
+        )
+        await mcp.run_streamable_http_async()
 
 
 def main():
@@ -1257,4 +1379,5 @@ def main():
 
 
 if __name__ == '__main__':
+    
     main()

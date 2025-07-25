@@ -10,8 +10,9 @@ Key features:
 
 - Bi-temporal data model with explicit tracking of event occurrence times
 - Hybrid retrieval combining semantic embeddings, keyword search (BM25), and graph traversal
-- Support for custom entity definitions via Pydantic models
+- Support for custom entity definitions via Pydantic models (allows flexible ontology creation)
 - Integration with Neo4j and FalkorDB as graph storage backends
+- Real-time incremental updates without batch recomputation
 
 ## Development Commands
 
@@ -97,7 +98,15 @@ docker-compose up
 
 - `OPENAI_API_KEY` - Required for LLM inference and embeddings
 - `USE_PARALLEL_RUNTIME` - Optional boolean for Neo4j parallel runtime (enterprise only)
+- `SEMAPHORE_LIMIT` - Controls concurrency (default: 10). Increase for higher throughput if your LLM provider allows it
+- `GRAPHITI_TELEMETRY_ENABLED` - Set to 'false' to disable anonymous usage telemetry
 - Provider-specific keys: `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, `VOYAGE_API_KEY`
+
+### Performance and Concurrency
+
+- **Concurrency**: Default concurrency is set low (SEMAPHORE_LIMIT=10) to prevent 429 rate limit errors
+- **Rate Limiting**: If you encounter 429 errors, lower SEMAPHORE_LIMIT. For higher throughput providers, increase it
+- **Telemetry**: Anonymous usage statistics are collected by default. Disable with `GRAPHITI_TELEMETRY_ENABLED=false`
 
 ### Database Setup
 
@@ -132,6 +141,15 @@ docker-compose up
 
 The codebase supports multiple LLM providers but works best with services supporting structured output (OpenAI, Gemini). Other providers may cause schema validation issues, especially with smaller models.
 
+**Installation with LLM providers:**
+```bash
+# Install with specific providers
+pip install graphiti-core[anthropic,groq,google-genai,falkordb]
+```
+
+**Azure OpenAI Configuration:**
+For Azure deployments, use separate AsyncAzureOpenAI clients for LLM and embedding endpoints. Pass these to OpenAIClient, OpenAIEmbedder, and OpenAIRerankerClient with your Azure deployment names in LLMConfig.
+
 ### MCP Server Usage Guidelines
 
 When working with the MCP server, follow the patterns established in `mcp_server/cursor_rules.md`:
@@ -140,3 +158,46 @@ When working with the MCP server, follow the patterns established in `mcp_server
 - Use specific entity type filters (`Preference`, `Procedure`, `Requirement`)
 - Store new information immediately using `add_memory`
 - Follow discovered procedures and respect established preferences
+
+## Fork-Specific Changes (Multi-Tenant Support)
+
+This fork includes significant improvements to the MCP server:
+
+### Docker Permission Fix
+- **Issue**: Original Dockerfile installed `uv` in root user directory, inaccessible after switching to `USER app`
+- **Solution**: Install `uv` to system path `/usr/local/bin/` for universal access
+- **Status**: Tested with Podman build - working correctly
+
+### Dynamic Project Support via X-Project Header
+- **Implementation**: Added `ProjectHeaderMiddleware` to extract `X-Project` HTTP header
+- **Validation**: Basic format validation (alphanumeric, hyphens, underscores only)  
+- **Case Handling**: Supports both `x-project` and `X-Project` headers
+- **Error Handling**: Graceful fallback if header extraction fails
+
+### Multi-Tenant Data Isolation
+- **Core Function**: `get_dynamic_group_id()` with priority system:
+  1. Explicit function parameter `group_id`
+  2. `X-Project` header value
+  3. Config default value
+- **Modified Tools**: All MCP tools now support dynamic group_id:
+  - `add_memory`
+  - `search_memory_nodes` 
+  - `search_memory_facts`
+  - `get_episodes`
+
+### Usage Patterns
+```bash
+# Via HTTP header (recommended for multi-tenant scenarios)
+curl -H "X-Project: project-name" ...
+
+# Via function parameter (backward compatible)
+add_memory(..., group_id="specific-project")
+
+# Default fallback (no header, no parameter)
+# Uses config.group_id or 'default'
+```
+
+### Data Isolation Guarantees
+- Graphiti uses strict Cypher WHERE clauses: `WHERE n.group_id IN $group_ids`
+- Different projects are completely isolated - no cross-project data access
+- Applies to all levels: nodes, edges, communities, fulltext search

@@ -31,4 +31,15 @@
 - **Prioritize specific matches:** More specific information takes precedence over general information.
 - **Be proactive:** If you notice patterns in user behavior, consider storing them as preferences or procedures.
 
-**Remember:** The knowledge graph is your memory. Use it consistently to provide personalized assistance that respects the user's established preferences, procedures, and factual context.
+### Multi-Tenant Usage
+
+- **Project Context Awareness:** Your default project context is set by X-Project headers in your MCP configuration. All tools automatically use this context unless overridden.
+- **Cross-Project Operations:** Use explicit `group_id` parameters to access data from other projects when needed:
+  ```
+  search_memory_nodes("requirements", group_id="shared-project")
+  add_memory("Cross-project note", "...", group_id="other-project")
+  ```
+- **Respect Project Boundaries:** Unless explicitly directed, keep data within the current project context. Don't accidentally leak information between projects.
+- **Project-Specific Preferences:** Remember that preferences and procedures are project-specific. A preference in "project-a" doesn't apply to "project-b".
+
+**Remember:** The knowledge graph is your memory. Use it consistently to provide personalized assistance that respects the user's established preferences, procedures, and factual context within the appropriate project scope.

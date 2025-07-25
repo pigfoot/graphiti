@@ -1,49 +1,72 @@
-# syntax=docker/dockerfile:1.9
-FROM python:3.12-slim
+# syntax=docker/dockerfile:1
+###############################
+# Builder stage
+###############################
+FROM docker.io/python:3.13-slim AS builder
 
-WORKDIR /app
+# Ensure apt-get doesn't open a menu on you.
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Install system dependencies first
+RUN <<EOT
+apt update -qy
+DEBIAN_FRONTEND=noninteractive
+apt install -qyy \
+    --no-install-recommends --no-install-suggests \
+    tini curl \
+    ca-certificates
+rm -rf /var/lib/apt/lists/*
+EOT
 
-# Install uv using the installer script
-ADD https://astral.sh/uv/install.sh /uv-installer.sh
-RUN sh /uv-installer.sh && rm /uv-installer.sh
+# Install uv using official distroless image (best practice)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# Add uv to PATH
-ENV PATH="/root/.local/bin:${PATH}"
-
-# Configure uv for optimal Docker usage
+# Configure uv environment variables
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    UV_PYTHON_DOWNLOADS=never \
-    MCP_SERVER_HOST="0.0.0.0" \
-    PYTHONUNBUFFERED=1
+    UV_PYTHON_DOWNLOADS=never
 
-# Create non-root user
-RUN groupadd -r app && useradd -r -d /app -g app app
+# Set working directory
+WORKDIR /app
 
-# Copy project files for dependency installation (better caching)
-COPY pyproject.toml uv.lock ./
-
-# Install dependencies first (better layer caching)
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --frozen --no-install-project --no-dev --no-editable
 
-# Copy application code
+# Then, add the rest of the project source code and install it
 COPY graphiti_mcp_server.py ./
 
-# Change ownership to app user
-RUN chown -Rv app:app /app
+# Installing separately from its dependencies allows optimal layer caching
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --frozen --no-dev --no-editable
 
-# Switch to non-root user
+###############################
+# Runtime stage
+###############################
+FROM docker.io/python:3.13-slim
+
+# Create non-root user and set up directory
+RUN <<EOT
+groupadd -r app
+useradd -r -d /app -g app -N app
+EOT
+
+# Copy tini and the application from the builder
+COPY --from=builder /usr/bin/tini-static /usr/bin/tini
+COPY --from=builder --chown=app:app /app /app
+
+# Setup virtual environment and place executables in the environment at the front of the path
+ENV PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/app/.venv \
+    MCP_SERVER_HOST="0.0.0.0" \
+    PATH="/app/.venv/bin:$PATH"
+
+# Switch to non-root user early & Set working directory
 USER app
+WORKDIR /app
 
-# Expose port
-EXPOSE 8000
-
-# Command to run the application
-CMD ["uv", "run", "graphiti_mcp_server.py"]
+ENTRYPOINT ["tini", "--"]
+CMD ["python", "graphiti_mcp_server.py"]

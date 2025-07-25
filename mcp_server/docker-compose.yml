@@ -1,6 +1,6 @@
 services:
   neo4j:
-    image: neo4j:5.26.0
+    image: docker.io/neo4j:5.26.0
     ports:
       - "7474:7474" # HTTP
       - "7687:7687" # Bolt
@@ -20,7 +20,12 @@ services:
       start_period: 30s
 
   graphiti-mcp:
-    image: zepai/knowledge-graph-mcp:latest
+    # Multi-architecture image with enhanced features (2025-07-28):
+    # - URL decoding and space handling for X-Project headers
+    # - Increased max_tokens (32K) to prevent response truncation  
+    # - Enhanced logging configuration
+    # - AMD64 + ARM64 support
+    image: pigfoot/graphiti-mcp:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -38,9 +43,10 @@ services:
       - MODEL_NAME=${MODEL_NAME}
       - PATH=/root/.local/bin:${PATH}
       - SEMAPHORE_LIMIT=${SEMAPHORE_LIMIT:-10}
+      - GRAPHITI_TELEMETRY_ENABLED=false
     ports:
-      - "8000:8000" # Expose the MCP server via HTTP for SSE transport
-    command: ["uv", "run", "graphiti_mcp_server.py", "--transport", "sse"]
+      - "8000:8000" # Expose /mcp endpoint (streamable-http transport with X-Project header support)
+    # Uses streamable-http transport by default (supports multi-tenant X-Project headers)
 
 volumes:
   neo4j_data:

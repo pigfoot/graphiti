@@ -30,6 +30,86 @@ Graphiti
 
 <br />
 
+## 🚀 Fork Changes
+
+This fork includes significant improvements to the MCP Server, implementing **true multi-tenant support** with complete data isolation:
+
+### ✅ Docker Permission Fix
+- **Issue**: Original Dockerfile installed `uv` in root user directory, inaccessible after switching to `USER app`
+- **Solution**: Install `uv` to system path `/usr/local/bin/` for universal access  
+- **Status**: ✅ Tested with Podman build - working correctly
+
+### ✅ Dynamic Project Support via X-Project Header  
+- **Implementation**: Uses native MCP Context objects to extract `X-Project` HTTP header
+- **Validation**: Basic format validation (alphanumeric, hyphens, underscores only)
+- **Case Handling**: Supports both `x-project` and `X-Project` headers (case-insensitive)
+- **Error Handling**: Graceful fallback if header extraction fails
+
+### ✅ Multi-Tenant Data Isolation
+- **Core Function**: `get_dynamic_group_id()` with priority system:
+  1. Explicit function parameter `group_id`
+  2. `X-Project` header value  
+  3. Config default value
+- **Modified Tools**: All MCP tools now support dynamic group_id via Context parameter:
+  - `add_memory` - Adding episodes with project isolation
+  - `search_memory_nodes` - Searching entities within project scope
+  - `search_memory_facts` - Finding relationships within project  
+  - `get_episodes` - Retrieving project-specific episodes
+
+### 🔒 Data Isolation Guarantees
+- **Graphiti Level**: Uses strict Cypher WHERE clauses: `WHERE n.group_id IN $group_ids`
+- **Complete Separation**: Different projects cannot access each other's data
+- **Search Isolation**: Applies to nodes, edges, communities, and fulltext search
+- **Backward Compatible**: Maintains all existing CLI arguments and API interfaces
+
+### 📖 Usage Patterns
+```bash
+# Via HTTP header (recommended for multi-tenant scenarios)
+curl -H "X-Project: project-name" ...
+
+# Via function parameter (backward compatible)
+add_memory(..., group_id="specific-project")
+
+# Default fallback (no header, no parameter)
+# Uses config.group_id or 'default'
+```
+
+### 🐳 Docker Deployment
+
+#### Quick Start with Published Image
+```bash
+# Pull and run the published image
+podman run -e OPENAI_API_KEY=your-key -p 8000:8000 docker.io/pigfoot/graphiti-mcp:latest
+
+# Or with Docker
+docker run -e OPENAI_API_KEY=your-key -p 8000:8000 docker.io/pigfoot/graphiti-mcp:latest
+```
+
+#### Build from Source
+```bash
+# Build container
+podman build -t graphiti-mcp .
+
+# Run container with environment variables
+podman run -e OPENAI_API_KEY=your-key -p 8000:8000 graphiti-mcp
+```
+
+### 🔧 Technical Implementation
+- **Native MCP**: Built using native MCP Python SDK with Context objects
+- **Dependencies**: Uses official `mcp>=1.5.0` without third-party middleware
+- **SSE Support**: `/sse` endpoint works correctly without redirects
+- **Error Handling**: Comprehensive validation and graceful fallback mechanisms  
+- **Performance**: Minimal overhead, no impact on existing single-tenant usage
+
+### 📊 Testing Results
+- **✅ SSE Endpoint**: `/sse` returns HTTP 200 directly (no redirects)
+- **✅ Header Processing**: X-Project headers correctly extracted from Context
+- **✅ Multi-Tenant Isolation**: Complete data separation verified
+- **✅ Docker Build**: Successfully builds and runs with Podman
+- **✅ Public Image**: Available at `docker.io/pigfoot/graphiti-mcp:latest`
+
+---
+
 > [!TIP]
 > Check out the new [MCP server for Graphiti](mcp_server/README.md)! Give Claude, Cursor, and other MCP clients powerful Knowledge Graph-based memory.
 

@@ -18,6 +18,7 @@ The Graphiti MCP server exposes the following key high-level functions of Graphi
 - **Episode Management**: Add, retrieve, and delete episodes (text, messages, or JSON data)
 - **Entity Management**: Search and manage entity nodes and relationships in the knowledge graph
 - **Search Capabilities**: Search for facts (edges) and node summaries using semantic and hybrid search
+- **Multi-Tenant Support**: Complete data isolation between projects using X-Project HTTP headers
 - **Group Management**: Organize and manage groups of related data with group_id filtering
 - **Graph Maintenance**: Clear the graph and rebuild indices
 
@@ -59,13 +60,166 @@ cd graphiti && pwd
 
 3. Point your MCP client to `http://localhost:8000/sse`
 
+## Multi-Tenant Support
+
+The Graphiti MCP server supports complete data isolation between different projects through HTTP headers. This allows multiple teams, applications, or contexts to use the same Graphiti instance while maintaining strict data separation.
+
+### How It Works
+
+The server uses a priority-based system to determine the `group_id` for each operation:
+
+1. **Explicit `group_id` parameter** (highest priority) - When MCP clients specify `group_id` in individual tool calls
+2. **X-Project HTTP header** - Used as default project context when no explicit `group_id` provided
+3. **Configuration default** - The `--group-id` command line argument
+4. **Fallback** - Uses `'default'` if nothing else is specified
+
+**Important:** X-Project headers provide a *default* project context, but MCP clients can override this by passing explicit `group_id` parameters to individual tool calls. This enables both automatic multi-tenancy via headers AND selective cross-project operations when needed.
+
+### Multi-Tenant Usage Patterns
+
+#### Automatic Project Context (Recommended)
+Configure your MCP client with X-Project headers to automatically route all operations to the correct project:
+
+```json
+{
+  "mcpServers": {
+    "graphiti-project-a": {
+      "transport": "streamable-http",
+      "url": "http://localhost:8000/mcp", 
+      "headers": {
+        "X-Project": "project-a"
+      }
+    }
+  }
+}
+```
+
+All tools (`add_memory`, `search_memory_nodes`, etc.) will automatically use "project-a" as the default `group_id`.
+
+#### Selective Cross-Project Operations
+Even with X-Project headers set, you can target specific projects by providing explicit `group_id` parameters:
+
+```python
+# This will use "project-b" instead of the X-Project header value
+add_memory(
+    name="Shared Resource",
+    episode_body="This resource is shared across projects",
+    group_id="project-b"  # Overrides X-Project header
+)
+
+# This will use the X-Project header value
+add_memory(
+    name="Project Resource", 
+    episode_body="This resource belongs to the current project"
+    # No group_id specified, uses X-Project header
+)
+```
+
+### Using X-Project Headers
+
+#### URL Decoding and Space Support (New in 2025-07-28)
+
+The server now supports human-readable project names with spaces and automatically handles URL encoding:
+
+```json
+{
+  "mcpServers": {
+    "graphiti-project-main": {
+      "transport": "streamable-http",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "X-Project": "My Project Name"
+      }
+    },
+    "graphiti-project-docs": {
+      "transport": "streamable-http", 
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "X-Project": "Documentation Project"
+      }
+    }
+  }
+}
+```
+
+**Technical Details:**
+- Spaces in project names are automatically converted to underscores for database compatibility
+- URL-encoded headers (like `My%20Project%20Name`) are automatically decoded
+- Final project names follow the pattern: `"My Project Name"` → `"My_Project_Name"`
+
+#### For streamable-http Transport
+
+```json
+{
+  "mcpServers": {
+    "graphiti-project-a": {
+      "transport": "streamable-http",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "X-Project": "project-a"
+      }
+    },
+    "graphiti-project-b": {
+      "transport": "streamable-http", 
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "X-Project": "project-b"
+      }
+    }
+  }
+}
+```
+
+#### Transport Options
+
+The server runs streamable-http transport by default:
+
+```bash
+uv run graphiti_mcp_server.py  # Uses streamable-http transport by default
+```
+
+This exposes:
+- Streamable-HTTP transport at `http://localhost:8000/mcp` (with X-Project header support)
+
+To use SSE transport instead:
+
+```bash
+uv run graphiti_mcp_server.py --transport sse
+```
+
+This exposes:
+- SSE transport at `http://localhost:8000/sse` (with X-Project header support)
+
+### Data Isolation Guarantees
+
+- **Complete Isolation**: Projects cannot access each other's data
+- **Automatic Filtering**: All database queries include `WHERE n.group_id = $project_id`
+- **Header Validation**: Invalid project names are rejected with fallback to default
+- **Case Insensitive**: Both `X-Project` and `x-project` headers are supported
+
+### Transport Compatibility
+
+| Transport | X-Project Header Support | Use Case |
+|-----------|-------------------------|----------|
+| `stdio` | ❌ No | Single-tenant, command-line tools |
+| `sse` | ✅ Yes | Single/Multi-tenant, HTTP clients |
+| `streamable-http` | ✅ Yes | Multi-tenant applications (default) |
+
 ## Installation
 
 ### Prerequisites
 
-1. Ensure you have Python 3.10 or higher installed.
+1. Ensure you have Python 3.13 or higher installed.
 2. A running Neo4j database (version 5.26 or later required)
 3. OpenAI API key for LLM operations
+
+### MCP Version Compatibility
+
+This fork includes significant upgrades:
+
+- **MCP Protocol**: Upgraded to version 1.12.2 (from 1.5.0)
+- **Python Support**: Python 3.13+ with latest dependency versions
+- **Enhanced Features**: Full streamable-http transport support with HTTP header access
 
 ### Setup
 
@@ -101,6 +255,7 @@ The server uses the following environment variables:
 - `AZURE_OPENAI_EMBEDDING_API_VERSION`: Optional Azure OpenAI API version
 - `AZURE_OPENAI_USE_MANAGED_IDENTITY`: Optional use Azure Managed Identities for authentication
 - `SEMAPHORE_LIMIT`: Episode processing concurrency. See [Concurrency and LLM Provider 429 Rate Limit Errors](#concurrency-and-llm-provider-429-rate-limit-errors)
+- `MAX_TOKENS`: Maximum tokens for LLM responses (default: 32768, increased from 8192 in 2025-07-28 to prevent response truncation)
 
 You can set these variables in a `.env` file in the project directory.
 
@@ -115,7 +270,7 @@ uv run graphiti_mcp_server.py
 With options:
 
 ```bash
-uv run graphiti_mcp_server.py --model gpt-4.1-mini --transport sse
+uv run graphiti_mcp_server.py --model gpt-4.1-mini --transport streamable-http
 ```
 
 Available arguments:
@@ -123,10 +278,18 @@ Available arguments:
 - `--model`: Overrides the `MODEL_NAME` environment variable.
 - `--small-model`: Overrides the `SMALL_MODEL_NAME` environment variable.
 - `--temperature`: Overrides the `LLM_TEMPERATURE` environment variable.
-- `--transport`: Choose the transport method (sse or stdio, default: sse)
+- `--transport`: Choose the transport method (`stdio`, `sse`, `streamable-http`; default: `streamable-http`)
 - `--group-id`: Set a namespace for the graph (optional). If not provided, defaults to "default".
 - `--destroy-graph`: If set, destroys all Graphiti graphs on startup.
 - `--use-custom-entities`: Enable entity extraction using the predefined ENTITY_TYPES
+
+### Transport Options
+
+The server supports three transport methods:
+
+- **stdio**: Standard input/output transport for command-line clients like Claude Desktop
+- **sse**: Server-sent events over HTTP for web-based clients (provides `/sse` endpoint with X-Project header support)  
+- **streamable-http**: HTTP-based transport with full MCP 1.12.2 compatibility and X-Project header support (provides `/mcp` endpoint, **default**)
 
 ### Concurrency and LLM Provider 429 Rate Limit Errors
 
@@ -134,6 +297,19 @@ Graphiti's ingestion pipelines are designed for high concurrency, controlled by 
 By default, `SEMAPHORE_LIMIT` is set to `10` concurrent operations to help prevent `429` rate limit errors from your LLM provider. If you encounter such errors, try lowering this value.
 
 If your LLM provider allows higher throughput, you can increase `SEMAPHORE_LIMIT` to boost episode ingestion performance.
+
+#### Token Limits and Response Handling
+
+The server automatically configures LLM clients with a `max_tokens` limit of **32,768** (increased from 8,192 in 2025-07-28). This change prevents response truncation issues that could cause:
+
+- Malformed JSON responses during entity extraction
+- Missing embedding generation for entities
+- Incomplete processing of large documents
+
+If you encounter token limit issues with very large content, consider:
+- Breaking large episodes into smaller chunks
+- Using the `source="json"` parameter for structured data
+- Monitoring logs for truncation warnings
 
 ### Docker Deployment
 
@@ -177,7 +353,7 @@ The Docker Compose setup includes a Neo4j container with the following default c
 
 #### Running with Docker Compose
 
-A Graphiti MCP container is available at: `zepai/knowledge-graph-mcp`. The latest build of this container is used by the Compose setup below.
+A multi-architecture Graphiti MCP container is available at: `pigfoot/graphiti-mcp:latest`. This container supports both AMD64 and ARM64 architectures and includes the latest improvements (URL decoding, space handling, increased token limits, and enhanced logging). The latest build of this container is used by the Compose setup below.
 
 Start the services using Docker Compose:
 
@@ -196,8 +372,10 @@ This will start both the Neo4j database and the Graphiti MCP server. The Docker 
 - Uses `uv` for package management and running the server
 - Installs dependencies from the `pyproject.toml` file
 - Connects to the Neo4j container using the environment variables
-- Exposes the server on port 8000 for HTTP-based SSE transport
+- Exposes the server on port 8000 for HTTP-based streamable-http transport (default)
 - Includes a healthcheck for Neo4j to ensure it's fully operational before starting the MCP server
+- **Multi-Architecture Support**: Container runs on both AMD64 and ARM64 platforms
+- **Enhanced Features**: Includes URL decoding, space handling, and improved logging
 
 ## Integrating with MCP Clients
 
@@ -239,14 +417,33 @@ To use the Graphiti MCP server with an MCP-compatible client, configure it to co
 }
 ```
 
-For SSE transport (HTTP-based), you can use this configuration:
+For SSE transport (HTTP-based) with multi-tenant support:
 
 ```json
 {
   "mcpServers": {
     "graphiti-memory": {
       "transport": "sse",
-      "url": "http://localhost:8000/sse"
+      "url": "http://localhost:8000/sse",
+      "headers": {
+        "X-Project": "my-project"
+      }
+    }
+  }
+}
+```
+
+For streamable-http transport with multi-tenant support:
+
+```json
+{
+  "mcpServers": {
+    "graphiti-memory": {
+      "transport": "streamable-http",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "X-Project": "my-project"
+      }
     }
   }
 }
@@ -306,7 +503,10 @@ docker compose up
 {
   "mcpServers": {
     "graphiti-memory": {
-      "url": "http://localhost:8000/sse"
+      "url": "http://localhost:8000/sse",
+      "headers": {
+        "X-Project": "cursor-project"
+      }
     }
   }
 }
@@ -360,10 +560,10 @@ The Graphiti MCP Server container uses the SSE MCP transport. Claude Desktop doe
 
 ## Requirements
 
-- Python 3.10 or higher
+- Python 3.13 or higher (upgraded from 3.10)
 - Neo4j database (version 5.26 or later required)
 - OpenAI API key (for LLM operations and embeddings)
-- MCP-compatible client
+- MCP-compatible client (supports MCP protocol 1.12.2)
 
 ## Telemetry
 
@@ -390,6 +590,53 @@ GRAPHITI_TELEMETRY_ENABLED=false
 ```
 
 For complete details about what's collected and why, see the [Telemetry section in the main Graphiti README](../README.md#telemetry).
+
+## Troubleshooting
+
+### Common Issues
+
+#### Missing Embeddings (`name_embedding` property not found)
+
+**Symptoms**: Neo4j warnings about missing `name_embedding` property during vector searches
+
+**Cause**: LLM responses being truncated due to token limits, preventing proper entity processing
+
+**Solution**: ✅ **Fixed in 2025-07-28** - Server now uses 32,768 token limit (increased from 8,192)
+
+#### Excessive Debug Logging
+
+**Symptoms**: Too many logs from Neo4j connections, SSE transport, or third-party libraries
+
+**Solution**: ✅ **Fixed in 2025-07-28** - Enhanced logging configuration automatically reduces noise from:
+- `neo4j.io` and `neo4j.pool` (connection details)
+- `sse_starlette.sse` (SSE transport internals)  
+- Other third-party library debug output
+
+#### URL-Encoded X-Project Headers
+
+**Symptoms**: Project headers like `My%20Project%20Name` not being recognized
+
+**Solution**: ✅ **Fixed in 2025-07-28** - Server automatically URL-decodes headers and converts spaces to underscores
+
+#### Multi-Architecture Docker Support
+
+**Symptoms**: Docker image not working on ARM64 platforms (Apple Silicon, ARM servers)
+
+**Solution**: ✅ **Fixed in 2025-07-28** - New multi-architecture image `pigfoot/graphiti-mcp:latest` supports both AMD64 and ARM64
+
+### Debug Commands
+
+```bash
+# Check current container logs
+docker logs graphiti-mcp-server
+
+# Verify X-Project header processing  
+curl -v -H "X-Project: My Test Project" http://localhost:8000/mcp
+
+# Check Neo4j embedding data
+docker exec -it neo4j cypher-shell -u neo4j -p demodemo \
+  "MATCH (n:Entity) RETURN count(n), count(n.name_embedding)"
+```
 
 ## License
 
